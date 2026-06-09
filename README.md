@@ -46,8 +46,8 @@ A sleek, full-stack YouTube downloader that converts videos to **MP3 audio** or 
 
 ```bash
 # 1. Clone the repo
-git clone https://github.com/abnormal-yi/yt-mp3-downloader.git
-cd yt-mp3-downloader
+git clone https://github.com/abnormal-yi/localtube.git
+cd localtube
 
 # 2. Install dependencies
 npm install
@@ -141,7 +141,7 @@ pip3 install yt-dlp
 
 # Run (use pm2 for persistence)
 npm install -g pm2
-pm2 start server.js --name yt-mp3
+pm2 start server.js --name localtube
 pm2 save
 ```
 
