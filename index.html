@@ -504,6 +504,74 @@
       text-decoration: underline;
     }
 
+    /* ── Queue list ────────────────────────────────────────────── */
+    .queue-wrap {
+      margin-top: 16px;
+      display: none;
+    }
+    .queue-wrap.show { display: block; }
+
+    .queue-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 12px;
+      margin-bottom: 6px;
+      border-radius: 10px;
+      background: rgba(255,255,255,0.03);
+      border: 1px solid rgba(255,255,255,0.06);
+      font-size: 13px;
+      animation: fadeSlideUp 0.3s ease;
+    }
+    .queue-item .q-status {
+      font-size: 16px;
+      flex-shrink: 0;
+    }
+    .queue-item .q-title {
+      flex: 1;
+      color: rgba(255,255,255,0.7);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .queue-item .q-action {
+      background: none;
+      border: none;
+      color: rgba(255,255,255,0.2);
+      cursor: pointer;
+      font-size: 16px;
+      padding: 2px 4px;
+    }
+    .queue-item .q-action:hover { color: #ef4444; }
+    .queue-item.done { border-color: rgba(34,197,94,0.2); }
+    .queue-item.error { border-color: rgba(239,68,68,0.2); }
+    .queue-item.processing { border-color: rgba(147,51,234,0.3); }
+
+    .queue-item .q-download-link {
+      color: #86efac;
+      text-decoration: none;
+      font-weight: 600;
+      font-size: 12px;
+    }
+    .queue-item .q-download-link:hover { text-decoration: underline; }
+
+    /* ── Drop zone overlay ─────────────────────────────────────── */
+    .card.drop-target {
+      border-color: rgba(147, 51, 234, 0.5);
+      box-shadow: 0 0 32px rgba(147, 51, 234, 0.2);
+    }
+    .drop-hint {
+      display: none;
+      text-align: center;
+      color: rgba(255,255,255,0.2);
+      font-size: 13px;
+      padding: 8px;
+      border: 1px dashed rgba(255,255,255,0.1);
+      border-radius: 10px;
+      margin-top: 12px;
+    }
+    .drop-hint.show { display: block; }
+
     /* ── Footer ────────────────────────────────────────────────── */
     .footer {
       margin-top: 24px;
@@ -586,8 +654,12 @@
         <div class="progress-label" id="progressLabel">Downloading & converting...</div>
       </div>
 
+      <div class="queue-wrap" id="queueWrap">
+        <div class="queue-list" id="queueList"></div>
+      </div>
+
       <div class="footer">
-        <p>localtube — paste, choose, download</p>
+        <p>localtube — paste, choose, download &bull; drops &amp; paste supported</p>
       </div>
     </div>
   </div>
@@ -632,6 +704,7 @@
     let currentVideoId = null;
     let selectedFormat = 'mp3';
     let progressInterval = null;
+    let queuePollInterval = null;
 
     // ── URL input → auto-preview ──────────────────────────────────
     urlInput.addEventListener('input', async () => {
@@ -667,7 +740,6 @@
         previewThumb.src = `https://img.youtube.com/vi/${videoId}/mqdefault.jpg`;
         preview.classList.add('show');
       } catch {
-        // Still show the thumbnail even if oembed fails
         previewTitle.textContent = 'Could not load video info';
         previewChannel.textContent = '';
         previewThumb.src = `https://img.youtube.com/vi/${videoId}/mqdefault.jpg`;
@@ -708,23 +780,61 @@
       });
     });
 
-    // ── Download flow ───────────────────────────────────────────────
+    // ── Download queue flow ─────────────────────────────────────────
     downloadBtn.addEventListener('click', async () => {
       if (!currentVideoId || downloadBtn.classList.contains('loading')) return;
 
       clearStatus();
-      progressWrap.classList.add('show');
-      const qualityLabels2 = {
-        'mp3': 'Converting to MP3...',
-        'mp4-720': 'Downloading 720p video...',
-        'mp4-1080': 'Downloading 1080p video...',
-        'mp4-1440': 'Downloading 2K video...',
-        'mp4-2160': 'Downloading 4K video...',
-      };
-      progressLabel.textContent = qualityLabels2[selectedFormat] || 'Downloading...';
       downloadBtn.classList.add('loading');
+      downloadBtn.querySelector('.icon').textContent = '⏳';
+      downloadBtn.querySelector('span:last-child').textContent = 'Adding to queue...';
+      downloadBtn.disabled = true;
 
-      // Poll /api/progress every 1 s for real-time feedback
+      try {
+        const res = await fetch('/api/queue', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: urlInput.value.trim(), format: selectedFormat }),
+        });
+
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({ error: 'Unknown error' }));
+          throw new Error(err.error || `Server ${res.status}`);
+        }
+
+        if (!progressInterval) startProgressPolling();
+        if (!queuePollInterval) startQueuePolling();
+
+        setStatus('info', '📥 Added to download queue');
+
+        getLabel();
+        downloadBtn.querySelector('.icon').textContent = '⚡';
+        downloadBtn.querySelector('span:last-child').textContent = getLabel(selectedFormat);
+        downloadBtn.classList.remove('loading');
+        downloadBtn.disabled = false;
+
+        // Clear input for the next URL
+        urlInput.value = '';
+        urlInput.classList.remove('valid');
+        preview.classList.remove('show');
+        currentVideoId = null;
+        downloadBtn.disabled = true;
+      } catch (err) {
+        setStatus('error', `❌ ${err.message}`);
+        downloadBtn.classList.remove('loading');
+        downloadBtn.querySelector('.icon').textContent = '⚡';
+        downloadBtn.querySelector('span:last-child').textContent = getLabel(selectedFormat);
+        downloadBtn.disabled = false;
+      }
+    });
+
+    function getLabel(fmt) {
+      return ({ mp3:'Download MP3', 'mp4-720':'Download 720p', 'mp4-1080':'Download 1080p', 'mp4-1440':'Download 2K', 'mp4-2160':'Download 4K' })[fmt] || 'Download';
+    }
+
+    // ── Progress polling ─────────────────────────────────────────────
+    function startProgressPolling() {
+      progressWrap.classList.add('show');
       progressInterval = setInterval(async () => {
         try {
           const r = await fetch('/api/progress');
@@ -738,63 +848,82 @@
           progressEta.textContent = d.eta ? `ETA ${d.eta}` : '';
         } catch {}
       }, 1000);
-      downloadBtn.querySelector('.icon').textContent = '⏳';
-      downloadBtn.querySelector('span:last-child').textContent = 'Converting...';
-      downloadBtn.disabled = true;
+    }
 
-      try {
-        const res = await fetch('/api/convert', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url: urlInput.value.trim(), format: selectedFormat }),
-        });
+    function stopProgressPolling() {
+      clearInterval(progressInterval);
+      progressInterval = null;
+      progressWrap.classList.remove('show');
+    }
 
-        if (!res.ok) {
-          const err = await res.json().catch(() => ({ error: 'Unknown error' }));
-          throw new Error(err.error || `Server ${res.status}`);
+    // ── Queue polling ────────────────────────────────────────────────
+    function startQueuePolling() {
+      queuePollInterval = setInterval(async () => {
+        try {
+          const r = await fetch('/api/queue');
+          const items = await r.json();
+          renderQueue(items);
+          const hasProcessing = items.some(i => i.status === 'processing' || i.status === 'queued');
+          if (!hasProcessing) { stopProgressPolling(); stopQueuePolling(); }
+        } catch {}
+      }, 2000);
+    }
+
+    function stopQueuePolling() {
+      clearInterval(queuePollInterval);
+      queuePollInterval = null;
+    }
+
+    function renderQueue(items) {
+      const wrap = document.getElementById('queueWrap');
+      const list = document.getElementById('queueList');
+      if (items.length === 0) { wrap.classList.remove('show'); return; }
+      wrap.classList.add('show');
+      list.innerHTML = items.map(item => {
+        const icon = { queued: '⏳', processing: '⬇️', done: '✅', error: '❌' }[item.status] || '⏳';
+        const label = item.url.length > 50 ? item.url.slice(0, 50) + '…' : item.url;
+        let actions = '';
+        if (item.status === 'done') {
+          if (Array.isArray(item.result)) {
+            actions = item.result.map(f => `<a href="${f.url}" class="q-download-link" download>⬇ ${f.title}</a>`).join(' ');
+          } else if (item.result) {
+            actions = `<a href="${item.result.url}" class="q-download-link" download>⬇ Download</a>`;
+          }
         }
-
-        const data = await res.json();
-
-        // Success: show download link
-        clearInterval(progressInterval);
-        progressWrap.classList.remove('show');
-        setStatus('success', '', true);
-        status.innerHTML = `
-          ✅ Converted successfully!${data.fileSize ? ' (' + data.fileSize + ')' : ''}
-          <br>
-          <a href="${data.url}" class="download-link" download="${data.title}.${data.ext}">
-            ⬇ Download "${data.title}.${data.ext}"
-          </a>
-        `;
-
-        downloadBtn.querySelector('.icon').textContent = '✅';
-        downloadBtn.querySelector('span:last-child').textContent = 'Downloaded!';
-
-        function getLabel(fmt) {
-          return ({ mp3:'Download MP3', 'mp4-720':'Download 720p', 'mp4-1080':'Download 1080p', 'mp4-1440':'Download 2K', 'mp4-2160':'Download 4K' })[fmt] || 'Download';
+        if (item.status === 'queued') {
+          actions = `<button class="q-action" data-id="${item.id}">✕</button>`;
         }
+        return `<div class="queue-item ${item.status}"><span class="q-status">${icon}</span><span class="q-title">${label}</span>${actions}</div>`;
+      }).join('');
+      list.querySelectorAll('.q-action').forEach(btn => {
+        btn.addEventListener('click', async () => { await fetch(`/api/queue/${btn.dataset.id}`, { method: 'DELETE' }); });
+      });
+    }
 
-        // Reset button after 3 s so user can download another
-        setTimeout(() => {
-          downloadBtn.querySelector('.icon').textContent = '⚡';
-          downloadBtn.querySelector('span:last-child').textContent = getLabel(selectedFormat);
-          downloadBtn.classList.remove('loading');
-          downloadBtn.disabled = false;
-        }, 3000);
-      } catch (err) {
-        // Error: show message and re-enable button
-        clearInterval(progressInterval);
-        progressWrap.classList.remove('show');
-        setStatus('error', `❌ ${err.message}`);
-        downloadBtn.classList.remove('loading');
-        downloadBtn.querySelector('.icon').textContent = '⚡';
-        downloadBtn.querySelector('span:last-child').textContent = getLabel(selectedFormat);
-        downloadBtn.disabled = false;
+    // ── Drag & drop ──────────────────────────────────────────────────
+    const card = document.querySelector('.card');
+    card.addEventListener('dragover', (e) => { e.preventDefault(); card.classList.add('drop-target'); });
+    card.addEventListener('dragleave', () => { card.classList.remove('drop-target'); });
+    card.addEventListener('drop', (e) => {
+      e.preventDefault();
+      card.classList.remove('drop-target');
+      const text = e.dataTransfer.getData('text');
+      if (text) { urlInput.value = text; urlInput.dispatchEvent(new Event('input')); }
+    });
+
+    // ── Clipboard detection on return ──────────────────────────────
+    document.addEventListener('visibilitychange', async () => {
+      if (document.visibilityState === 'visible' && !urlInput.value) {
+        try {
+          const text = await navigator.clipboard.readText();
+          if (text && (text.includes('youtube.com') || text.includes('youtu.be'))) {
+            urlInput.value = text;
+            urlInput.dispatchEvent(new Event('input'));
+          }
+        } catch {}
       }
     });
 
-    // Trigger preview when user pastes a link
     urlInput.addEventListener('paste', () => {
       setTimeout(() => urlInput.dispatchEvent(new Event('input')), 50);
     });

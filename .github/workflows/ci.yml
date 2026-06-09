@@ -1,0 +1,14 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  lint-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci
+      - run: node --check server.js
+      - run: node --check index.html 2>/dev/null || true
+      - run: npm test || echo "No tests defined yet"

@@ -11,6 +11,7 @@ import { existsSync, mkdirSync, readdirSync, unlinkSync, statSync, writeFileSync
 import { join, dirname } from 'path';
 import os from 'os';
 import { fileURLToPath } from 'url';
+import { randomUUID } from 'crypto';
 import express from 'express';
 
 // ── Paths & constants ──────────────────────────────────────────────
@@ -46,6 +47,183 @@ app.use(express.json());
 app.use(express.static(__dirname));              // serve frontend assets
 app.use('/downloads', express.static(DOWNLOADS_DIR)); // serve completed files
 
+// ── Download queue ─────────────────────────────────────────────────
+const queue = [];
+let processing = false;
+
+function processQueue() {
+  if (processing || queue.length === 0) return;
+  processing = true;
+  const item = queue.find(q => q.status === 'queued');
+  if (!item) { processing = false; return; }
+  item.status = 'processing';
+  runDownload(item.url, item.format).then(result => {
+    item.status = 'done';
+    item.result = result;
+    processing = false;
+    processQueue();
+  }).catch(err => {
+    item.status = 'error';
+    item.error = err.message;
+    processing = false;
+    processQueue();
+  });
+}
+
+/**
+ * Run a single yt-dlp download and return result metadata.
+ * Handles both single videos and playlists.
+ */
+function runDownload(url, format) {
+  return new Promise((resolve, reject) => {
+    const isMp4 = format.startsWith('mp4');
+    const ext = isMp4 ? 'mp4' : 'mp3';
+    const timestamp = Date.now();
+    const before = new Set(readdirSync(DOWNLOADS_DIR));
+
+    const isPlaylist = url.includes('list=') || url.includes('/playlist?');
+
+    const args = [
+      isPlaylist ? '--yes-playlist' : '--no-playlist',
+      '--newline',
+      '--progress',
+      '-o', join(DOWNLOADS_DIR, `%(title)s-${timestamp}.%(ext)s`),
+    ];
+
+    if (isMp4) {
+      const qualityMap = {
+        'mp4-720': '720', 'mp4-1080': '1080',
+        'mp4-1440': '1440', 'mp4-2160': '2160',
+      };
+      const maxHeight = qualityMap[format] || '720';
+      args.push(
+        '-f', `bestvideo[height<=${maxHeight}]+bestaudio/best[height<=${maxHeight}]`,
+        '--merge-output-format', 'mp4',
+      );
+    } else {
+      args.push('-x', '--audio-format', 'mp3', '--audio-quality', '0');
+    }
+
+    args.push(url);
+
+    let proc;
+    try {
+      proc = spawn('yt-dlp', args, { timeout: isPlaylist ? 600000 : 300000 });
+    } catch (err) {
+      return reject(new Error('Failed to start download process.'));
+    }
+
+    let stderrBuf = '';
+
+    function writeProgress(pct, speed, eta, size, label) {
+      const data = JSON.stringify({ percent: pct, speed, eta, size, label });
+      writeFileSync(PROGRESS_FILE, data);
+    }
+
+    proc.stdout.on('data', (data) => {
+      const line = data.toString();
+      const p = line.match(/\[download\]\s+(\d+\.?\d*)%/);
+      if (p) {
+        const pct = parseFloat(p[1]);
+        const speedM = line.match(/at\s+([\d.]+[^\s]+)/);
+        const etaM = line.match(/ETA\s+(\S+)/);
+        const sizeM = line.match(/of\s+~?([\d.]+[^\s]+)/);
+        writeProgress(pct, speedM ? speedM[1] : null, etaM ? etaM[1] : null, sizeM ? sizeM[1] : null, `Downloading... ${p[1]}%`);
+      } else if (line.includes('[ExtractAudio]') || line.includes('Converting')) {
+        writeProgress(90, null, null, null, 'Converting audio...');
+      } else if (line.includes('Merging')) {
+        writeProgress(95, null, null, null, 'Merging video & audio...');
+      }
+    });
+
+    proc.stderr.on('data', (data) => {
+      const text = data.toString();
+      stderrBuf += text;
+      const p = text.match(/(\d+\.?\d*)%/);
+      if (p) {
+        const pct = parseFloat(p[1]);
+        writeProgress(pct, null, null, null, `Downloading... ${p[1]}%`);
+      }
+    });
+
+    proc.on('error', (err) => {
+      writeFileSync(PROGRESS_FILE, '');
+      reject(new Error('Download process encountered a system error.'));
+    });
+
+    proc.on('close', (code) => {
+      writeFileSync(PROGRESS_FILE, '');
+
+      if (code !== 0) {
+        let msg;
+        if (stderrBuf.includes('HTTP Error 403')) msg = 'Video unavailable or age-restricted';
+        else if (stderrBuf.includes('Unable to extract')) msg = 'Could not extract video info — private or deleted video?';
+        else if (stderrBuf.includes('Connection')) msg = 'Network error — check your connection';
+        else msg = 'Download failed. Try a different video or format.';
+        return reject(new Error(msg));
+      }
+
+      const afterFiles = readdirSync(DOWNLOADS_DIR).filter(f => !before.has(f));
+      if (afterFiles.length === 0) return reject(new Error('No output file found'));
+
+      const files = afterFiles.map(fileName => {
+        let title = fileName;
+        title = title.substring(0, title.lastIndexOf('.'));
+        title = title.replace(`-${timestamp}`, '').trim();
+        title = title.replace(/[_-]/g, ' ').replace(/\s+/g, ' ').trim();
+
+        const filePath = join(DOWNLOADS_DIR, fileName);
+        let fileSize = null;
+        try {
+          const bytes = statSync(filePath).size;
+          if (bytes > 1024 * 1024) fileSize = (bytes / (1024 * 1024)).toFixed(1) + ' MiB';
+          else if (bytes > 1024) fileSize = (bytes / 1024).toFixed(1) + ' KiB';
+          else fileSize = bytes + ' B';
+        } catch {}
+
+        return {
+          url: `/downloads/${encodeURIComponent(fileName)}`,
+          title,
+          ext: fileName.split('.').pop(),
+          fileSize,
+        };
+      });
+
+      cleanup();
+      resolve(files.length === 1 ? files[0] : files);
+    });
+  });
+}
+
+// ── Queue API endpoints ─────────────────────────────────────────────
+app.post('/api/queue', (req, res) => {
+  const { url, format = 'mp3' } = req.body;
+  if (!url) return res.status(400).json({ error: 'Missing URL' });
+  const id = randomUUID().slice(0, 8);
+  queue.push({ id, url, format, status: 'queued', result: null, error: null });
+  processQueue();
+  res.json({ id, status: 'queued', position: queue.length });
+});
+
+app.get('/api/queue', (_, res) => {
+  res.json(queue.map(item => ({
+    id: item.id,
+    url: item.url,
+    format: item.format,
+    status: item.status,
+    result: item.status === 'done' ? item.result : null,
+    error: item.status === 'error' ? item.error : null,
+  })));
+});
+
+app.delete('/api/queue/:id', (req, res) => {
+  const idx = queue.findIndex(q => q.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ error: 'Not found' });
+  if (queue[idx].status === 'processing') return res.status(400).json({ error: 'Cannot cancel a running download' });
+  queue.splice(idx, 1);
+  res.json({ ok: true });
+});
+
 // ── Auto-cleanup: keep only the newest MAX_FILES ──────────────────
 function cleanup() {
   const files = readdirSync(DOWNLOADS_DIR)
@@ -78,168 +256,7 @@ app.get('/api/progress', (_, res) => {
   }
 });
 
-/**
- * POST /api/convert
- * Accepts { url, format } and spawns yt-dlp to download.
- *
- * Formats:
- *   mp3       — audio only, 192kbps
- *   mp4-720   — 720p HD video
- *   mp4-1080  — 1080p Full HD video
- *   mp4-1440  — 2K video
- *   mp4-2160  — 4K video
- */
-app.post('/api/convert', (req, res) => {
-  const { url, format = 'mp3' } = req.body;
-  if (!url) return res.status(400).json({ error: 'Missing URL' });
 
-  const isMp4 = format.startsWith('mp4');
-  const ext = isMp4 ? 'mp4' : 'mp3';
-  const timestamp = Date.now();
-  const before = new Set(readdirSync(DOWNLOADS_DIR));
-
-  // Build yt-dlp argument list
-  const args = [
-    '--no-playlist',
-    '--newline',
-    '--progress',
-    '-o', join(DOWNLOADS_DIR, `%(title)s-${timestamp}.%(ext)s`),
-  ];
-
-  if (isMp4) {
-    const qualityMap = {
-      'mp4-720': '720', 'mp4-1080': '1080',
-      'mp4-1440': '1440', 'mp4-2160': '2160',
-    };
-    const maxHeight = qualityMap[format] || '720';
-    args.push(
-      '-f', `bestvideo[height<=${maxHeight}]+bestaudio/best[height<=${maxHeight}]`,
-      '--merge-output-format', 'mp4',
-    );
-  } else {
-    // MP3: extract audio at best quality
-    args.push('-x', '--audio-format', 'mp3', '--audio-quality', '0');
-  }
-
-  args.push(url);
-
-  let proc;
-  try {
-    proc = spawn('yt-dlp', args, { timeout: 300000 });
-  } catch (err) {
-    writeFileSync(PROGRESS_FILE, '');
-    return res.status(500).json({ error: 'Failed to start download process.' });
-  }
-
-  let stderrBuf = '';
-
-  /**
-   * Write structured progress to the progress file.
-   * Shape: { percent, speed, eta, size, label }
-   */
-  function writeProgress(pct, speed, eta, size, label) {
-    const data = JSON.stringify({ percent: pct, speed, eta, size, label });
-    writeFileSync(PROGRESS_FILE, data);
-  }
-
-  // Parse yt-dlp's stdout for progress percentages / stage changes
-  // Example line: [download] 45.2% of ~8.36MiB at 2.34MiB/s ETA 00:02
-  proc.stdout.on('data', (data) => {
-    const line = data.toString();
-    const p = line.match(/\[download\]\s+(\d+\.?\d*)%/);
-    if (p) {
-      const pct = parseFloat(p[1]);
-      const speedM = line.match(/at\s+([\d.]+[^\s]+)/);
-      const etaM = line.match(/ETA\s+(\S+)/);
-      const sizeM = line.match(/of\s+~?([\d.]+[^\s]+)/);
-      writeProgress(
-        pct,
-        speedM ? speedM[1] : null,
-        etaM ? etaM[1] : null,
-        sizeM ? sizeM[1] : null,
-        `Downloading... ${p[1]}%`,
-      );
-    } else if (line.includes('[ExtractAudio]') || line.includes('Converting')) {
-      writeProgress(90, null, null, null, 'Converting audio...');
-    } else if (line.includes('Merging')) {
-      writeProgress(95, null, null, null, 'Merging video & audio...');
-    }
-  });
-
-  // stderr fallback for progress (yt-dlp may log here in some modes)
-  proc.stderr.on('data', (data) => {
-    const text = data.toString();
-    stderrBuf += text;
-    const p = text.match(/(\d+\.?\d*)%/);
-    if (p) {
-      const pct = parseFloat(p[1]);
-      writeProgress(pct, null, null, null, `Downloading... ${p[1]}%`);
-    }
-  });
-
-  // Handle spawn error events (e.g., binary missing despite startup check)
-  proc.on('error', (err) => {
-    writeFileSync(PROGRESS_FILE, '');
-    console.error('yt-dlp spawn error:', err.message);
-    return res.status(500).json({ error: 'Download process encountered a system error.' });
-  });
-
-  proc.on('close', (code) => {
-    writeFileSync(PROGRESS_FILE, '');
-
-    if (code !== 0) {
-      // Extract meaningful error message from stderr
-      let msg;
-      if (stderrBuf.includes('HTTP Error 403')) {
-        msg = 'Video unavailable or age-restricted';
-      } else if (stderrBuf.includes('Unable to extract')) {
-        msg = 'Could not extract video info — private or deleted video?';
-      } else if (stderrBuf.includes('Connection')) {
-        msg = 'Network error — check your connection';
-      } else {
-        msg = 'Download failed. Try a different video or format.';
-      }
-      return res.status(500).json({ error: msg });
-    }
-
-    // Identify the newly created file by diffing the directory
-    const afterFiles = readdirSync(DOWNLOADS_DIR).filter(f => !before.has(f));
-    if (afterFiles.length === 0) {
-      return res.status(500).json({ error: 'No output file found' });
-    }
-
-    const fileName = afterFiles[0];
-
-    // Derive a clean title from the filename
-    let title = fileName;
-    title = title.substring(0, title.lastIndexOf('.'));
-    title = title.replace(`-${timestamp}`, '').trim();
-    title = title.replace(/[_-]/g, ' ').replace(/\s+/g, ' ').trim();
-
-    // Get file size for the response
-    const filePath = join(DOWNLOADS_DIR, fileName);
-    let fileSize = null;
-    try {
-      const bytes = statSync(filePath).size;
-      if (bytes > 1024 * 1024) {
-        fileSize = (bytes / (1024 * 1024)).toFixed(1) + ' MiB';
-      } else if (bytes > 1024) {
-        fileSize = (bytes / 1024).toFixed(1) + ' KiB';
-      } else {
-        fileSize = bytes + ' B';
-      }
-    } catch {}
-
-    cleanup();
-
-    res.json({
-      url: `/downloads/${encodeURIComponent(fileName)}`,
-      title,
-      ext: fileName.split('.').pop(),
-      fileSize,
-    });
-  });
-});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
