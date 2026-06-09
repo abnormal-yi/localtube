@@ -1,6 +1,6 @@
 <div align="center">
   <br>
-  <h1>🎵 YT → MP3/MP4</h1>
+  <h1>🎵 localtube</h1>
   <p><strong>Paste a YouTube link. Choose quality. Download. That's it.</strong></p>
   <br>
   <p>
@@ -10,7 +10,7 @@
     <img src="https://img.shields.io/badge/platform-linux%20%7C%20macOS%20%7C%20windows-lightgrey">
   </p>
   <br>
-  <img src="screenshot.png" alt="App Screenshot" width="400">
+  <img src="https://raw.githubusercontent.com/abnormal-yi/localtube/main/screenshot.png" alt="App Screenshot" width="400">
   <br><br>
 </div>
 
