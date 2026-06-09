@@ -1,8 +1,12 @@
 {
-  "name": "yt-mp3-downloader",
+  "name": "localtube",
   "version": "1.0.0",
+  "description": "Paste a YouTube link. Choose quality. Download. That's it.",
   "private": true,
   "type": "module",
+  "bin": {
+    "localtube": "./bin/localtube.js"
+  },
   "scripts": {
     "start": "node server.js",
     "test": "node --test test/*.test.js"

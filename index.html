@@ -807,7 +807,6 @@
 
         setStatus('info', '📥 Added to download queue');
 
-        getLabel();
         downloadBtn.querySelector('.icon').textContent = '⚡';
         downloadBtn.querySelector('span:last-child').textContent = getLabel(selectedFormat);
         downloadBtn.classList.remove('loading');

@@ -23,7 +23,26 @@ describe('localtube server', () => {
   it('should export required API routes', () => {
     const src = readFileSync('server.js', 'utf-8');
     assert.ok(src.includes('/api/progress'), 'GET /api/progress not found');
-    assert.ok(src.includes('/api/convert'), 'POST /api/convert not found');
+    assert.ok(src.includes('/api/queue'), 'POST /api/queue not found');
+    assert.ok(src.includes('/api/progress'), 'progress endpoint exists');
+  });
+
+  it('should have queue processing logic', () => {
+    const src = readFileSync('server.js', 'utf-8');
+    assert.ok(src.includes('processQueue'), 'queue processor function missing');
+    assert.ok(src.includes('randomUUID'), 'UUID for queue IDs missing');
+  });
+
+  it('should detect playlist URLs', () => {
+    const src = readFileSync('server.js', 'utf-8');
+    assert.ok(src.includes('--yes-playlist'), 'playlist support missing');
+    assert.ok(src.includes('--no-playlist'), 'single video fallback present');
+  });
+
+  it('should have CLI bin entry', () => {
+    const pkg = JSON.parse(readFileSync('package.json', 'utf-8'));
+    assert.ok(pkg.bin?.localtube, 'CLI bin entry missing');
+    assert.ok(existsSync('bin/localtube.js'), 'CLI file missing');
   });
 
   it('should have yt-dlp and ffmpeg dependency checks', () => {
