@@ -1,3 +1,11 @@
+/**
+ * localtube — Full-stack YouTube to MP3/MP4 downloader.
+ *
+ * Server-side entry point. Express serves the frontend,
+ * accepts conversion requests, spawns yt-dlp, and streams
+ * real-time progress back to the client.
+ */
+
 import { spawn } from 'child_process';
 import { existsSync, mkdirSync, readdirSync, unlinkSync, statSync, writeFileSync, readFileSync } from 'fs';
 import { join, dirname } from 'path';
@@ -5,20 +13,24 @@ import os from 'os';
 import { fileURLToPath } from 'url';
 import express from 'express';
 
+// ── Paths & constants ──────────────────────────────────────────────
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DOWNLOADS_DIR = join(os.homedir(), 'Downloads', 'yt-mp3');
 const PROGRESS_FILE = join(__dirname, '.progress');
-const MAX_FILES = 20;
+const MAX_FILES = 20;               // max cached downloads before cleanup
 
+// Ensure the download directory exists on startup
 if (!existsSync(DOWNLOADS_DIR)) {
   mkdirSync(DOWNLOADS_DIR, { recursive: true });
 }
 
+// ── Express setup ──────────────────────────────────────────────────
 const app = express();
 app.use(express.json());
-app.use(express.static(__dirname));
-app.use('/downloads', express.static(DOWNLOADS_DIR));
+app.use(express.static(__dirname));              // serve frontend assets
+app.use('/downloads', express.static(DOWNLOADS_DIR)); // serve completed files
 
+// ── Auto-cleanup: keep only the newest MAX_FILES ──────────────────
 function cleanup() {
   const files = readdirSync(DOWNLOADS_DIR)
     .map(f => ({ name: join(DOWNLOADS_DIR, f), time: statSync(join(DOWNLOADS_DIR, f)).mtimeMs }))
@@ -30,6 +42,10 @@ function cleanup() {
   }
 }
 
+/**
+ * GET /api/progress
+ * Returns the current download progress for real-time polling.
+ */
 app.get('/api/progress', (_, res) => {
   try {
     const data = readFileSync(PROGRESS_FILE, 'utf-8').trim();
@@ -39,6 +55,17 @@ app.get('/api/progress', (_, res) => {
   }
 });
 
+/**
+ * POST /api/convert
+ * Accepts { url, format } and spawns yt-dlp to download.
+ *
+ * Formats:
+ *   mp3       — audio only, 192kbps
+ *   mp4-720   — 720p HD video
+ *   mp4-1080  — 1080p Full HD video
+ *   mp4-1440  — 2K video
+ *   mp4-2160  — 4K video
+ */
 app.post('/api/convert', (req, res) => {
   const { url, format = 'mp3' } = req.body;
   if (!url) return res.status(400).json({ error: 'Missing URL' });
@@ -48,6 +75,7 @@ app.post('/api/convert', (req, res) => {
   const timestamp = Date.now();
   const before = new Set(readdirSync(DOWNLOADS_DIR));
 
+  // Build yt-dlp argument list
   const args = [
     '--no-playlist',
     '--newline',
@@ -66,6 +94,7 @@ app.post('/api/convert', (req, res) => {
       '--merge-output-format', 'mp4',
     );
   } else {
+    // MP3: extract audio at best quality
     args.push('-x', '--audio-format', 'mp3', '--audio-quality', '0');
   }
 
@@ -75,6 +104,7 @@ app.post('/api/convert', (req, res) => {
 
   let stderrBuf = '';
 
+  // Parse yt-dlp's stdout for progress percentages / stage changes
   proc.stdout.on('data', (data) => {
     const line = data.toString();
     const p = line.match(/\[download\]\s+(\d+\.\d+)%/);
@@ -87,6 +117,7 @@ app.post('/api/convert', (req, res) => {
     }
   });
 
+  // stderr fallback for progress (yt-dlp may log here in some modes)
   proc.stderr.on('data', (data) => {
     const text = data.toString();
     stderrBuf += text;
@@ -104,6 +135,7 @@ app.post('/api/convert', (req, res) => {
       return res.status(500).json({ error: msg });
     }
 
+    // Identify the newly created file by diffing the directory
     const afterFiles = readdirSync(DOWNLOADS_DIR).filter(f => !before.has(f));
     if (afterFiles.length === 0) {
       return res.status(500).json({ error: 'No output file found' });
@@ -111,6 +143,7 @@ app.post('/api/convert', (req, res) => {
 
     const fileName = afterFiles[0];
 
+    // Derive a clean title from the filename
     let title = fileName;
     title = title.substring(0, title.lastIndexOf('.'));
     title = title.replace(`-${timestamp}`, '').trim();
