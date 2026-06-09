@@ -128,5 +128,5 @@ app.post('/api/convert', (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`YT to MP3 running at http://localhost:${PORT}`);
+  console.log(`localtube running at http://localhost:${PORT}`);
 });
