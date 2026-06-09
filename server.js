@@ -6,7 +6,7 @@
  * real-time progress back to the client.
  */
 
-import { spawn } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
 import { existsSync, mkdirSync, readdirSync, unlinkSync, statSync, writeFileSync, readFileSync } from 'fs';
 import { join, dirname } from 'path';
 import os from 'os';
@@ -26,6 +26,22 @@ if (!existsSync(DOWNLOADS_DIR)) {
 
 // ── Express setup ──────────────────────────────────────────────────
 const app = express();
+
+// ── Dependency check at startup ────────────────────────────────────
+function checkDependency(name) {
+  const result = spawnSync('which', [name]);
+  if (result.status !== 0) {
+    console.error(`🚨 Missing dependency: ${name} is not installed.`);
+    console.error(`   Install: pip3 install yt-dlp  (or: brew install yt-dlp)`);
+    process.exit(1);
+  }
+  console.log(`  ✓ ${name} found`);
+}
+
+console.log('\n🔍 Checking dependencies...');
+checkDependency('yt-dlp');
+checkDependency('ffmpeg');
+
 app.use(express.json());
 app.use(express.static(__dirname));              // serve frontend assets
 app.use('/downloads', express.static(DOWNLOADS_DIR)); // serve completed files
@@ -44,14 +60,21 @@ function cleanup() {
 
 /**
  * GET /api/progress
- * Returns the current download progress for real-time polling.
+ * Returns structured progress JSON for real-time polling.
+ * { percent, speed, eta, size, label }
  */
 app.get('/api/progress', (_, res) => {
   try {
     const data = readFileSync(PROGRESS_FILE, 'utf-8').trim();
-    res.json({ progress: data || 'Preparing...' });
+    if (!data) return res.json({ percent: 0, label: 'Preparing...' });
+    try {
+      const parsed = JSON.parse(data);
+      return res.json(parsed);
+    } catch {
+      return res.json({ percent: 0, label: data });
+    }
   } catch {
-    res.json({ progress: 'Processing...' });
+    res.json({ percent: 0, label: 'Processing...' });
   }
 });
 
@@ -100,20 +123,46 @@ app.post('/api/convert', (req, res) => {
 
   args.push(url);
 
-  const proc = spawn('yt-dlp', args, { timeout: 300000 });
+  let proc;
+  try {
+    proc = spawn('yt-dlp', args, { timeout: 300000 });
+  } catch (err) {
+    writeFileSync(PROGRESS_FILE, '');
+    return res.status(500).json({ error: 'Failed to start download process.' });
+  }
 
   let stderrBuf = '';
 
+  /**
+   * Write structured progress to the progress file.
+   * Shape: { percent, speed, eta, size, label }
+   */
+  function writeProgress(pct, speed, eta, size, label) {
+    const data = JSON.stringify({ percent: pct, speed, eta, size, label });
+    writeFileSync(PROGRESS_FILE, data);
+  }
+
   // Parse yt-dlp's stdout for progress percentages / stage changes
+  // Example line: [download] 45.2% of ~8.36MiB at 2.34MiB/s ETA 00:02
   proc.stdout.on('data', (data) => {
     const line = data.toString();
-    const p = line.match(/\[download\]\s+(\d+\.\d+)%/);
+    const p = line.match(/\[download\]\s+(\d+\.?\d*)%/);
     if (p) {
-      writeFileSync(PROGRESS_FILE, `Downloading... ${p[1]}%`);
+      const pct = parseFloat(p[1]);
+      const speedM = line.match(/at\s+([\d.]+[^\s]+)/);
+      const etaM = line.match(/ETA\s+(\S+)/);
+      const sizeM = line.match(/of\s+~?([\d.]+[^\s]+)/);
+      writeProgress(
+        pct,
+        speedM ? speedM[1] : null,
+        etaM ? etaM[1] : null,
+        sizeM ? sizeM[1] : null,
+        `Downloading... ${p[1]}%`,
+      );
     } else if (line.includes('[ExtractAudio]') || line.includes('Converting')) {
-      writeFileSync(PROGRESS_FILE, 'Converting audio...');
+      writeProgress(90, null, null, null, 'Converting audio...');
     } else if (line.includes('Merging')) {
-      writeFileSync(PROGRESS_FILE, 'Merging video & audio...');
+      writeProgress(95, null, null, null, 'Merging video & audio...');
     }
   });
 
@@ -121,17 +170,35 @@ app.post('/api/convert', (req, res) => {
   proc.stderr.on('data', (data) => {
     const text = data.toString();
     stderrBuf += text;
-    const p = text.match(/(\d+\.\d+)%/);
+    const p = text.match(/(\d+\.?\d*)%/);
     if (p) {
-      writeFileSync(PROGRESS_FILE, `Downloading... ${p[1]}%`);
+      const pct = parseFloat(p[1]);
+      writeProgress(pct, null, null, null, `Downloading... ${p[1]}%`);
     }
+  });
+
+  // Handle spawn error events (e.g., binary missing despite startup check)
+  proc.on('error', (err) => {
+    writeFileSync(PROGRESS_FILE, '');
+    console.error('yt-dlp spawn error:', err.message);
+    return res.status(500).json({ error: 'Download process encountered a system error.' });
   });
 
   proc.on('close', (code) => {
     writeFileSync(PROGRESS_FILE, '');
 
     if (code !== 0) {
-      const msg = stderrBuf.slice(0, 300) || 'Unknown error';
+      // Extract meaningful error message from stderr
+      let msg;
+      if (stderrBuf.includes('HTTP Error 403')) {
+        msg = 'Video unavailable or age-restricted';
+      } else if (stderrBuf.includes('Unable to extract')) {
+        msg = 'Could not extract video info — private or deleted video?';
+      } else if (stderrBuf.includes('Connection')) {
+        msg = 'Network error — check your connection';
+      } else {
+        msg = 'Download failed. Try a different video or format.';
+      }
       return res.status(500).json({ error: msg });
     }
 
@@ -149,12 +216,27 @@ app.post('/api/convert', (req, res) => {
     title = title.replace(`-${timestamp}`, '').trim();
     title = title.replace(/[_-]/g, ' ').replace(/\s+/g, ' ').trim();
 
+    // Get file size for the response
+    const filePath = join(DOWNLOADS_DIR, fileName);
+    let fileSize = null;
+    try {
+      const bytes = statSync(filePath).size;
+      if (bytes > 1024 * 1024) {
+        fileSize = (bytes / (1024 * 1024)).toFixed(1) + ' MiB';
+      } else if (bytes > 1024) {
+        fileSize = (bytes / 1024).toFixed(1) + ' KiB';
+      } else {
+        fileSize = bytes + ' B';
+      }
+    } catch {}
+
     cleanup();
 
     res.json({
       url: `/downloads/${encodeURIComponent(fileName)}`,
       title,
       ext: fileName.split('.').pop(),
+      fileSize,
     });
   });
 });

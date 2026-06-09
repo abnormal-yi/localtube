@@ -331,23 +331,39 @@
       display: flex;
     }
 
-    .progress-bar {
+    .progress-track {
       width: 100%;
-      height: 4px;
+      height: 6px;
       background: rgba(255, 255, 255, 0.06);
-      border-radius: 4px;
+      border-radius: 6px;
       overflow: hidden;
       position: relative;
     }
 
-    .progress-bar::after {
-      content: '';
-      position: absolute;
-      inset: 0;
-      width: 40%;
+    .progress-fill {
+      height: 100%;
+      width: 0%;
       background: linear-gradient(90deg, #9333ea, #ec4899, #f97316);
-      border-radius: 4px;
+      border-radius: 6px;
+      transition: width 0.3s ease;
+    }
+
+    .progress-bar {
+      width: 100%;
+      height: 6px;
+      background: rgba(255, 255, 255, 0.06);
+      border-radius: 6px;
+      overflow: hidden;
+      display: none;
+    }
+
+    .progress-bar.active {
+      display: block;
+    }
+
+    .progress-bar.active .progress-fill {
       animation: progressIndeterminate 1.5s ease-in-out infinite;
+      width: 40%;
     }
 
     @keyframes progressIndeterminate {
@@ -359,6 +375,14 @@
       color: rgba(255, 255, 255, 0.35);
       font-size: 12px;
       text-align: center;
+    }
+
+    .progress-meta {
+      display: flex;
+      justify-content: space-between;
+      color: rgba(255, 255, 255, 0.2);
+      font-size: 11px;
+      font-family: monospace;
     }
 
     /* ── Status messages (error / success / info) ──────────────── */
@@ -549,7 +573,16 @@
       <div class="status" id="status"></div>
 
       <div class="progress-wrap" id="progressWrap">
-        <div class="progress-bar" id="progressBar"></div>
+        <div class="progress-track">
+          <div class="progress-fill" id="progressFill"></div>
+        </div>
+        <div class="progress-bar" id="progressBar">
+          <div class="progress-fill"></div>
+        </div>
+        <div class="progress-meta" id="progressMeta">
+          <span id="progressSpeed"></span>
+          <span id="progressEta"></span>
+        </div>
         <div class="progress-label" id="progressLabel">Downloading & converting...</div>
       </div>
 
@@ -569,7 +602,10 @@
     const previewChannel = document.getElementById('previewChannel');
     const status = document.getElementById('status');
     const progressWrap = document.getElementById('progressWrap');
+    const progressFill = document.getElementById('progressFill');
     const progressLabel = document.getElementById('progressLabel');
+    const progressSpeed = document.getElementById('progressSpeed');
+    const progressEta = document.getElementById('progressEta');
 
     // ── Helpers ─────────────────────────────────────────────────────
 
@@ -693,7 +729,13 @@
         try {
           const r = await fetch('/api/progress');
           const d = await r.json();
-          if (d.progress) progressLabel.textContent = d.progress;
+          if (d.label) progressLabel.textContent = d.label;
+          if (d.percent != null) {
+            progressFill.style.width = d.percent + '%';
+            progressFill.parentElement.classList.remove('active');
+          }
+          progressSpeed.textContent = d.speed || '';
+          progressEta.textContent = d.eta ? `ETA ${d.eta}` : '';
         } catch {}
       }, 1000);
       downloadBtn.querySelector('.icon').textContent = '⏳';
@@ -719,7 +761,7 @@
         progressWrap.classList.remove('show');
         setStatus('success', '', true);
         status.innerHTML = `
-          ✅ Converted successfully!
+          ✅ Converted successfully!${data.fileSize ? ' (' + data.fileSize + ')' : ''}
           <br>
           <a href="${data.url}" class="download-link" download="${data.title}.${data.ext}">
             ⬇ Download "${data.title}.${data.ext}"
@@ -729,10 +771,14 @@
         downloadBtn.querySelector('.icon').textContent = '✅';
         downloadBtn.querySelector('span:last-child').textContent = 'Downloaded!';
 
+        function getLabel(fmt) {
+          return ({ mp3:'Download MP3', 'mp4-720':'Download 720p', 'mp4-1080':'Download 1080p', 'mp4-1440':'Download 2K', 'mp4-2160':'Download 4K' })[fmt] || 'Download';
+        }
+
         // Reset button after 3 s so user can download another
         setTimeout(() => {
           downloadBtn.querySelector('.icon').textContent = '⚡';
-          downloadBtn.querySelector('span:last-child').textContent = 'Download MP3';
+          downloadBtn.querySelector('span:last-child').textContent = getLabel(selectedFormat);
           downloadBtn.classList.remove('loading');
           downloadBtn.disabled = false;
         }, 3000);
@@ -743,7 +789,7 @@
         setStatus('error', `❌ ${err.message}`);
         downloadBtn.classList.remove('loading');
         downloadBtn.querySelector('.icon').textContent = '⚡';
-        downloadBtn.querySelector('span:last-child').textContent = 'Download MP3';
+        downloadBtn.querySelector('span:last-child').textContent = getLabel(selectedFormat);
         downloadBtn.disabled = false;
       }
     });
